@@ -238,6 +238,141 @@ __device__ __forceinline__ void writeResult(T* topKSliceStart,
   indicesSliceStart[indexOffset] = i; // write the index to the output slice.
 }
 
+// helper function to write the result to the output.
+template <typename T, typename IndexType, typename MatchPredicate, typename WritePredicate, typename BreakPredicate>
+__device__ __forceinline__ void gatherTopKPhase(
+                                            const T* inputSliceStart,
+                                            IndexType inputSliceSize,
+                                            IndexType inputWithinSliceStride,
+                                            IndexType topKWithinSliceStride,
+                                            IndexType indicesWithinSliceStride,
+
+                                            typename TopKTypeConfig<T>::RadixType topKConverted,
+
+                                            MatchPredicate matchPredicate,
+                                            WritePredicate writePredicate,
+                                            BreakPredicate breakPredicate,
+
+                                            int& writeIndexStart,
+
+                                            IndexType outputSliceSize,
+                                            T* topKSliceStart,
+                                            int64_t* indicesSliceStart) {
+
+  constexpr IndexType unroll_factor = 4;
+  IndexType unroll_segment = (inputSliceSize / (blockDim.x * unroll_factor)) * blockDim.x * unroll_factor;
+
+  for (IndexType i = threadIdx.x; i < unroll_segment; i += unroll_factor * blockDim.x) {
+
+    const T v0 = doLdg(&inputSliceStart[i * inputWithinSliceStride]);
+    const T v1 = doLdg(&inputSliceStart[(i + 1 * blockDim.x) * inputWithinSliceStride]);
+    const T v2 = doLdg(&inputSliceStart[(i + 2 * blockDim.x) * inputWithinSliceStride]);
+    const T v3 = doLdg(&inputSliceStart[(i + 3 * blockDim.x) * inputWithinSliceStride]);
+
+    const auto convertedV0 = at::native::TopKTypeConfig<T>::convert(v0);
+    const auto convertedV1 = at::native::TopKTypeConfig<T>::convert(v1);
+    const auto convertedV2 = at::native::TopKTypeConfig<T>::convert(v2);
+    const auto convertedV3 = at::native::TopKTypeConfig<T>::convert(v3);
+
+    bool hasTopK0 = matchPredicate(convertedV0, topKConverted);
+    bool hasTopK1 = matchPredicate(convertedV1, topKConverted);
+    bool hasTopK2 = matchPredicate(convertedV2, topKConverted);
+    bool hasTopK3 = matchPredicate(convertedV3, topKConverted);
+
+    int start_index0, my_offset0, warp_count0;
+    int start_index1, my_offset1, warp_count1;
+    int start_index2, my_offset2, warp_count2;
+    int start_index3, my_offset3, warp_count3;
+    reserveWarpSpace(hasTopK0, writeIndexStart, start_index0, my_offset0, warp_count0);
+    reserveWarpSpace(hasTopK1, writeIndexStart, start_index1, my_offset1, warp_count1);
+    reserveWarpSpace(hasTopK2, writeIndexStart, start_index2, my_offset2, warp_count2);
+    reserveWarpSpace(hasTopK3, writeIndexStart, start_index3, my_offset3, warp_count3);
+
+    // now warp has reserved space for itself. If hasTopK == true, we need to find the index to write the result to.
+    if (writePredicate(outputSliceSize, hasTopK0, start_index0, my_offset0)) {
+      writeResult(topKSliceStart,
+        indicesSliceStart,
+        topKWithinSliceStride,
+        indicesWithinSliceStride,
+        outputSliceSize,
+        /*writeIndex=*/start_index0 + my_offset0,
+        /*value=*/v0,
+        /*index=*/i);
+    }
+    if (writePredicate(outputSliceSize, hasTopK1, start_index1, my_offset1)) {
+      writeResult(topKSliceStart,
+        indicesSliceStart,
+        topKWithinSliceStride,
+        indicesWithinSliceStride,
+        outputSliceSize,
+        /*writeIndex=*/start_index1 + my_offset1,
+        /*value=*/v1,
+        /*index=*/i + 1 * blockDim.x);
+    }
+    if (writePredicate(outputSliceSize, hasTopK2, start_index2, my_offset2)) {
+      writeResult(topKSliceStart,
+        indicesSliceStart,
+        topKWithinSliceStride,
+        indicesWithinSliceStride,
+        outputSliceSize,
+        /*writeIndex=*/start_index2 + my_offset2,
+        /*value=*/v2,
+        /*index=*/i + 2 * blockDim.x);
+    }
+    if (writePredicate(outputSliceSize, hasTopK3, start_index3, my_offset3)) {
+      writeResult(topKSliceStart,
+        indicesSliceStart,
+        topKWithinSliceStride,
+        indicesWithinSliceStride,
+        outputSliceSize,
+        /*writeIndex=*/start_index3 + my_offset3,
+        /*value=*/v3,
+        /*index=*/i + 3 * blockDim.x);
+    }
+
+    if (breakPredicate(outputSliceSize, warp_count0, start_index0) ||
+        breakPredicate(outputSliceSize, warp_count1, start_index1) ||
+        breakPredicate(outputSliceSize, warp_count2, start_index2) ||
+        breakPredicate(outputSliceSize, warp_count3, start_index3)) {
+      break;
+    }
+
+  }
+
+  IndexType numIterations = round_up(inputSliceSize, (IndexType) warpSize);
+
+  T v = (unroll_segment + threadIdx.x < inputSliceSize) ? doLdg(&inputSliceStart[(unroll_segment + threadIdx.x) * inputWithinSliceStride]) : static_cast<T>(0);
+  for (IndexType i = unroll_segment + threadIdx.x; i < numIterations; i += blockDim.x) {
+    T v_next = (i + blockDim.x < inputSliceSize) ? doLdg(&inputSliceStart[(i + blockDim.x) * inputWithinSliceStride]) : static_cast<T>(0);
+
+    bool hasTopK = false;
+    if (i < inputSliceSize) {
+      const auto convertedV = at::native::TopKTypeConfig<T>::convert(v);
+      hasTopK = matchPredicate(convertedV, topKConverted);
+    }
+
+    int start_index, my_offset, warp_count;
+    reserveWarpSpace(hasTopK, writeIndexStart, start_index, my_offset, warp_count);
+
+    if (breakPredicate(outputSliceSize, warp_count, start_index)) {
+      break;
+    }
+
+    // now warp has reserved space for itself. If hasTopK == true, we need to find the index to write the result to.
+    if (writePredicate(outputSliceSize, hasTopK, start_index, my_offset)) {
+      writeResult(topKSliceStart,
+        indicesSliceStart,
+        topKWithinSliceStride,
+        indicesWithinSliceStride,
+        outputSliceSize,
+        /*writeIndex=*/start_index + my_offset,
+        /*value=*/v,
+        /*index=*/i);
+    }
+    v = v_next;
+  }
+}
+
 template <typename T, typename IndexType, int Dim, bool WithKthValues>
 C10_LAUNCH_BOUNDS_1(1024)
 __global__ void gatherTopK(at::cuda::detail::TensorInfo<const T, IndexType> input,
@@ -306,38 +441,43 @@ __global__ void gatherTopK(at::cuda::detail::TensorInfo<const T, IndexType> inpu
     writeIndexStart = 0;
   }
   __syncthreads();
-  // All threads within the warp need to participate in the loop, so rounding up to a multiple of the warp size.
-  IndexType numIterations = round_up(inputSliceSize, (IndexType) warpSize);
 
   // phase 1: write actual > `pattern` (or < `pattern`, depending on the sort direction) values to the output.
   // prefetching data from global memory.
-  T v = (threadIdx.x < inputSliceSize) ? doLdg(&inputSliceStart[threadIdx.x * inputWithinSliceStride]) : static_cast<T>(0);
-  for (IndexType i = threadIdx.x; i < numIterations; i += blockDim.x) {
-    T v_next = (i + blockDim.x < inputSliceSize) ? doLdg(&inputSliceStart[(i + blockDim.x) * inputWithinSliceStride]) : static_cast<T>(0);
 
-    bool hasTopK = false;
-    if (i < inputSliceSize) {
-      const auto convertedV = at::native::TopKTypeConfig<T>::convert(v);
-      hasTopK = (largest) ? (convertedV > topKConverted) : (convertedV < topKConverted);
-    }
+  using RadixType = typename TopKTypeConfig<T>::RadixType;
+  // // Use function pointer to select comparison once (avoids branching in hot path)
+  // // This selects the function once based on largest, avoiding repeated branching in the loop
+  // bool (*matchPredicate)(const RadixType&, const RadixType&);
+  // if (largest) {
+  //   matchPredicate = [](const RadixType& v, const RadixType& topKConverted) -> bool {
+  //     return v > topKConverted;
+  //   };
+  // } else {
+  //   matchPredicate = [](const RadixType& v, const RadixType& topKConverted) -> bool {
+  //     return v < topKConverted;
+  //   };
+  // }
 
-    int start_index, my_offset, warp_count;
-    reserveWarpSpace(hasTopK, writeIndexStart, start_index, my_offset, warp_count);
+  gatherTopKPhase<T, IndexType>(
+    inputSliceStart,
+    inputSliceSize,
+    inputWithinSliceStride,
+    topKWithinSliceStride,
+    indicesWithinSliceStride,
 
-    // now warp has reserved space for itself. If hasTopK == true, we need to find the index to write the result to.
-    if (hasTopK) {
-      writeResult(topKSliceStart,
-        indicesSliceStart,
-        topKWithinSliceStride,
-        indicesWithinSliceStride,
-        outputSliceSize,
-        /*writeIndex=*/start_index + my_offset,
-        /*value=*/v,
-        /*index=*/i);
-    }
+    topKConverted,
 
-    v = v_next;
-  }
+    /*matchPredicate=*/ (largest) ? [](const RadixType& v, const RadixType& topKConverted) -> bool { return v > topKConverted; } : 
+                                    [](const RadixType& v, const RadixType& topKConverted) -> bool { return v < topKConverted; },
+    /*writePredicate=*/ [](const IndexType& outputSliceSize, const bool& hasTopK, const int& start_index, const int& my_offset) -> bool { return hasTopK; },
+    /*breakPredicate=*/ [](const IndexType& outputSliceSize, const int& warp_count, const int& start_index) -> bool { return false; },
+
+    writeIndexStart,
+
+    outputSliceSize,
+    topKSliceStart,
+    indicesSliceStart);
 
   // till this point, actual > `pattern` values were being written.
   // we first need to sync to make sure all threads have completed phase 1:
@@ -350,39 +490,26 @@ __global__ void gatherTopK(at::cuda::detail::TensorInfo<const T, IndexType> inpu
   // in a similar warp level compaction fashion as in phase 1.
 
   // phase 2: write actual == `pattern` values to the output.
-  // prefetching data from global memory.
-  T V = (threadIdx.x < inputSliceSize) ? doLdg(&inputSliceStart[threadIdx.x * inputWithinSliceStride]) : static_cast<T>(0);
-  for (IndexType i = threadIdx.x; i < numIterations; i += blockDim.x) {
-    T V_next = (i + blockDim.x < inputSliceSize) ? doLdg(&inputSliceStart[(i + blockDim.x) * inputWithinSliceStride]) : static_cast<T>(0);
-    bool hasTopK = false;
-    if (i < inputSliceSize) {
-      const auto convertedV = at::native::TopKTypeConfig<T>::convert(V);
-      hasTopK = convertedV == topKConverted;
-    }
+  gatherTopKPhase<T, IndexType>(
+    inputSliceStart,
+    inputSliceSize,
+    inputWithinSliceStride,
+    topKWithinSliceStride,
+    indicesWithinSliceStride,
 
-    int start_index, my_offset, warp_count;
-    reserveWarpSpace(hasTopK, writeIndexStart, start_index, my_offset, warp_count);
+    topKConverted,
 
-    if ((warp_count > 0) && (outputSliceSize <= start_index)){
-      break; // there is no space to add topk values. Break out of the loop.
-    }
+    /*matchPredicate=*/ [](const RadixType& v, const RadixType& topKConverted) -> bool { return v == topKConverted; },
+    /*writePredicate=*/ [](const IndexType& outputSliceSize, const bool& hasTopK, const int& start_index, const int& my_offset) -> bool {
+      return hasTopK && (start_index + my_offset < outputSliceSize); },
+    /*breakPredicate=*/ [](const IndexType& outputSliceSize, const int& warp_count, const int& start_index) -> bool {
+      return (warp_count > 0) && (outputSliceSize <= start_index); },
 
-    if (hasTopK){
-      int slots_available = outputSliceSize - start_index;
-      if (my_offset < slots_available){
-        writeResult(topKSliceStart,
-          indicesSliceStart,
-          topKWithinSliceStride,
-          indicesWithinSliceStride,
-          outputSliceSize,
-          /*writeIndex=*/start_index + my_offset,
-          /*value=*/V,
-          /*index=*/i);
-      }
-    }
+    writeIndexStart,
 
-    V = V_next;
-  }
+    outputSliceSize,
+    topKSliceStart,
+    indicesSliceStart);
 }
 
 #endif
@@ -1478,16 +1605,16 @@ void launch_gather_topk_kernel(
 
 #if defined(USE_ROCM) && HAS_WARP_MERGE_SORT()
 #define RUN_MB(INDEX_T, DIM)                                              \
-  if (should_use_warp_topk(sliceSize, k)) {                               \
+  if (false &&should_use_warp_topk(sliceSize, k)) {                               \
     RUN_K(INDEX_T, DIM, warptopk::launch);                                \
-  } else if (should_use_multiblock(numInputSlices, sliceSize)) {          \
+  } else if (false && should_use_multiblock(numInputSlices, sliceSize)) {          \
     RUN_K(INDEX_T, DIM, mbtopk::launch);                                  \
   } else {                                                                \
     RUN_K(INDEX_T, DIM, sbtopk::launch);                                  \
   }
 #else
 #define RUN_MB(INDEX_T, DIM)                                              \
-  if (should_use_multiblock(numInputSlices, sliceSize)) {                 \
+  if (false && should_use_multiblock(numInputSlices, sliceSize)) {                 \
     RUN_K(INDEX_T, DIM, mbtopk::launch);                                  \
   } else {                                                                \
     RUN_K(INDEX_T, DIM, sbtopk::launch);                                  \
