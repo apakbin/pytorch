@@ -88,6 +88,10 @@ _N_SCAN_GROUPS = _N_HIST_BINS // _SCAN_GROUP_BINS
 if _N_HIST_BINS % _SCAN_GROUP_BINS != 0:
     raise AssertionError("_SCAN_GROUP_BINS must divide _N_HIST_BINS")
 _REGISTER_ROWS_PER_CTA = 2
+# Buffer loads issued per wide step of the radix histogram and the
+# non-deterministic gather, before any of them is consumed. Each wave then has
+# several loads in flight instead of waiting on every one.
+_LOADS_IN_FLIGHT = 4
 _ORD_BITS = 32
 
 
@@ -401,6 +405,10 @@ def _build_radix_select_topk_module(
         vec_iters = n // tile
         vec_end = vec_iters * tile
         scalar_tail_iters = (n - vec_end + (block_threads - 1)) // block_threads
+        # Defined outside any `if`: FlyDSL turns an `if` body into a nested
+        # function, so a name first assigned inside one is not visible later.
+        wide_iters = vec_iters // _LOADS_IN_FLIGHT
+        wide_end = wide_iters * _LOADS_IN_FLIGHT
 
         input_buf = fx.rocdl.make_buffer_tensor(input)
         values_buf = fx.rocdl.make_buffer_tensor(values)
@@ -502,7 +510,28 @@ def _build_radix_select_topk_module(
             # Accumulate the current byte histogram.
             prefix = s_prefix[0]
             decided_mask = s_mask[0]
-            for step in range(vec_iters):
+            for wstep in range(wide_iters):
+                chunks = []
+                for j in range_constexpr(_LOADS_IN_FLIGHT):
+                    chunks.append(
+                        _load_vec(
+                            spec,
+                            copy_atom_v,
+                            input_div,
+                            (wstep * _LOADS_IN_FLIGHT + j) * block_threads + tid,
+                        )
+                    )
+                for j in range_constexpr(_LOADS_IN_FLIGHT):
+                    for vi in range_constexpr(spec.vec):
+                        accumulate_radix_byte_hist(
+                            spec.to_ord(chunks[j][vi]),
+                            byte_pos,
+                            prefix,
+                            decided_mask,
+                            shift,
+                            sign_bit_xor_val,
+                        )
+            for step in range(wide_end, vec_iters):
                 rvals = _load_vec(
                     spec, copy_atom_v, input_div, step * block_threads + tid
                 )
@@ -659,7 +688,23 @@ def _build_radix_select_topk_module(
                         vals[pos] = val
                         idxs[pos] = idx
 
-            for step in range(vec_iters):
+            for wstep in range(wide_iters):
+                chunks = []
+                for j in range_constexpr(_LOADS_IN_FLIGHT):
+                    chunks.append(
+                        _load_vec(
+                            spec,
+                            copy_atom_v,
+                            input_div,
+                            (wstep * _LOADS_IN_FLIGHT + j) * block_threads + tid,
+                        )
+                    )
+                for j in range_constexpr(_LOADS_IN_FLIGHT):
+                    base = (wstep * _LOADS_IN_FLIGHT + j) * tile + tid * spec.vec
+                    for vi in range_constexpr(spec.vec):
+                        idx = fx.Int32(base + vi)
+                        gather_candidate(chunks[j][vi], idx, s_vals, s_idxs)
+            for step in range(wide_end, vec_iters):
                 tile_base = step * tile
                 base = tile_base + tid * spec.vec
                 rvals = _load_vec(
